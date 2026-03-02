@@ -1,0 +1,325 @@
+{
+  "name": "GitHub PR Auto Test Generation (OpenRouter)",
+  "nodes": [
+    {
+      "id": "1",
+      "name": "GitHub PR Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [260, 300],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "github-pr-auto-tests",
+        "responseMode": "onReceived",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "webhookId": "github-pr-auto-tests"
+    },
+    {
+      "id": "2",
+      "name": "Extract PR Data",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [520, 300],
+      "parameters": {
+        "functionCode": "const body = items[0].json.body || items[0].json;\n\n// GitHub sends the payload in `body` when using rawBody\nconst pr = body.pull_request || body;\n\nreturn [{\n  json: {\n    repoFullName: pr.head.repo.full_name,\n    headRef: pr.head.ref,\n    baseRef: pr.base.ref,\n    prNumber: pr.number,\n    prTitle: pr.title,\n    prUrl: pr.html_url\n  }\n}];"
+      }
+    },
+    {
+      "id": "3",
+      "name": "Get Changed Files",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [780, 200],
+      "parameters": {
+        "url": "https://api.github.com/repos={{$json[\"repoFullName\"]}}/pulls/{{$json[\"prNumber\"]}}/files",
+        "method": "GET",
+        "authentication": "none",
+        "responseFormat": "json",
+        "headerParametersUi": {
+          "parameter": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{$env[\"GITHUB_TOKEN\"]}}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "4",
+      "name": "Get Requirements (wiki/requirements.md)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [780, 420],
+      "parameters": {
+        "url": "https://raw.githubusercontent.com/{{$json[\"repoFullName\"]}}/{{$json[\"headRef\"]}}/wiki/requirements.md",
+        "method": "GET",
+        "authentication": "none",
+        "responseFormat": "string",
+        "headerParametersUi": {
+          "parameter": []
+        }
+      }
+    },
+    {
+      "id": "5",
+      "name": "Build OpenRouter Prompt",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1040, 310],
+      "parameters": {
+        "functionCode": "const changedFiles = items[0].json; // from Get Changed Files\nconst requirements = items[1].json; // from Get Requirements\n\n// Build a compact summary of changed files\nlet diffSummary = changedFiles.map(f => {\n  return `File: ${f.filename}\\nStatus: ${f.status}\\nPatch:\\n${f.patch || \"(no patch)\"}`;\n}).join(\"\\n\\n---\\n\\n\");\n\nconst systemPrompt = `You are an expert software engineer and test architect.\nYou will receive:\n1) A list of changed files with patches (Git diff style)\n2) A requirements document\n\nYour tasks:\n- Briefly assess if the changes align with the requirements\n- Identify potential risks or missing edge cases\n- Generate high-quality unit tests for the changed code\n- Use a modern testing framework (e.g., Jest for JS/TS, PyTest for Python) based on the file extensions\n\nOutput JSON with the following fields:\n{\n  \"requirements_alignment\": string,\n  \"risks\": string,\n  \"test_framework\": string,\n  \"test_file_suggestions\": [\n    {\n      \"target_file\": string,\n      \"suggested_test_path\": string,\n      \"test_code\": string\n    }\n  ]\n}`;\n\nconst userPrompt = `REQUIREMENTS DOCUMENT:\\n\\n${requirements}\\n\\n====================\\n\\nCHANGED FILES AND PATCHES:\\n\\n${diffSummary}`;\n\nreturn [{\n  json: {\n    systemPrompt,\n    userPrompt\n  }\n}];"
+      }
+    },
+    {
+      "id": "6",
+      "name": "Call OpenRouter (auto)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [1300, 310],
+      "parameters": {
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "method": "POST",
+        "authentication": "none",
+        "responseFormat": "json",
+        "jsonParameters": true,
+        "options": {
+          "timeout": 600000
+        },
+        "headerParametersUi": {
+          "parameter": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{$env[\"OPENROUTER_API_KEY\"]}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "bodyParametersJson": "={\n  \"model\": \"openrouter/auto\",\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": {{$json[\"systemPrompt\"]}}\n    },\n    {\n      \"role\": \"user\",\n      \"content\": {{$json[\"userPrompt\"]}}\n    }\n  ],\n  \"temperature\": 0.2\n}"
+      }
+    },
+    {
+      "id": "7",
+      "name": "Parse OpenRouter Response",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1560, 310],
+      "parameters": {
+        "functionCode": "const choice = items[0].json.choices?.[0];\nif (!choice) {\n  throw new Error('No choices returned from OpenRouter');\n}\n\nlet content = choice.message?.content || '';\n\n// Try to parse JSON from the model output\nlet parsed;\ntry {\n  parsed = JSON.parse(content);\n} catch (e) {\n  // Try to extract JSON block if wrapped in markdown\n  const match = content.match(/```json([\\s\\S]*?)```/i) || content.match(/```([\\s\\S]*?)```/i);\n  if (match) {\n    try {\n      parsed = JSON.parse(match[1]);\n    } catch (e2) {\n      throw new Error('Failed to parse JSON from model output');\n    }\n  } else {\n    throw new Error('Model output is not valid JSON');\n  }\n}\n\nreturn [{ json: parsed }];"
+      }
+    },
+    {
+      "id": "8",
+      "name": "Prepare Test Commits",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1820, 310],
+      "parameters": {
+        "functionCode": "const tests = items[0].json.test_file_suggestions || [];\n\n// We'll emit one item per test file suggestion\nconst results = tests.map(t => ({\n  json: {\n    target_file: t.target_file,\n    suggested_test_path: t.suggested_test_path,\n    test_code: t.test_code\n  }\n}));\n\nreturn results.length ? results : [{ json: { target_file: null, suggested_test_path: null, test_code: \"\" } }];"
+      }
+    },
+    {
+      "id": "9",
+      "name": "Create/Update Test File in PR Branch",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [2080, 220],
+      "parameters": {
+        "url": "https://api.github.com/repos={{$item(0).$node[\"Extract PR Data\"].json[\"repoFullName\"]}}/contents/{{$json[\"suggested_test_path\"]}}",
+        "method": "PUT",
+        "authentication": "none",
+        "responseFormat": "json",
+        "jsonParameters": true,
+        "headerParametersUi": {
+          "parameter": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{$env[\"GITHUB_TOKEN\"]}}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            }
+          ]
+        },
+        "bodyParametersJson": "={\n  \"message\": \"chore: auto-generated tests for {{$json[\"target_file\"]}}\",\n  \"content\": {{ Buffer.from($json[\"test_code\"]).toString('base64') }},\n  \"branch\": \"{{$item(0).$node[\"Extract PR Data\"].json[\"headRef\"]}}\"\n}"
+      }
+    },
+    {
+      "id": "10",
+      "name": "Summarize For PR Comment",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1820, 520],
+      "parameters": {
+        "functionCode": "const alignment = $item(0).$node[\"Parse OpenRouter Response\"].json.requirements_alignment || \"\";\nconst risks = $item(0).$node[\"Parse OpenRouter Response\"].json.risks || \"\";\nconst tests = $item(0).$node[\"Parse OpenRouter Response\"].json.test_file_suggestions || [];\n\nconst testList = tests.map(t => `- ${t.suggested_test_path} (for ${t.target_file})`).join(\"\\n\");\n\nconst body = `🤖 Automated Test Generation Report\\n\\n**Requirements alignment**\\n${alignment}\\n\\n**Risks / potential gaps**\\n${risks}\\n\\n**Generated test files**\\n${testList || \"(none)\"}`;\n\nreturn [{ json: { body } }];"
+      }
+    },
+    {
+      "id": "11",
+      "name": "Post PR Comment",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [2080, 520],
+      "parameters": {
+        "url": "https://api.github.com/repos={{$node[\"Extract PR Data\"].json[\"repoFullName\"]}}/issues/{{$node[\"Extract PR Data\"].json[\"prNumber\"]}}/comments",
+        "method": "POST",
+        "authentication": "none",
+        "responseFormat": "json",
+        "jsonParameters": true,
+        "headerParametersUi": {
+          "parameter": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{$env[\"GITHUB_TOKEN\"]}}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            }
+          ]
+        },
+        "bodyParametersJson": "={\n  \"body\": {{$json[\"body\"]}}\n}"
+      }
+    }
+  ],
+  "connections": {
+    "Extract PR Data": {
+      "main": [
+        [
+          {
+            "node": "Get Changed Files",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Get Requirements (wiki/requirements.md)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GitHub PR Webhook": {
+      "main": [
+        [
+          {
+            "node": "Extract PR Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Changed Files": {
+      "main": [
+        [
+          {
+            "node": "Build OpenRouter Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Requirements (wiki/requirements.md)": {
+      "main": [
+        [
+          {
+            "node": "Build OpenRouter Prompt",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Build OpenRouter Prompt": {
+      "main": [
+        [
+          {
+            "node": "Call OpenRouter (auto)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call OpenRouter (auto)": {
+      "main": [
+        [
+          {
+            "node": "Parse OpenRouter Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse OpenRouter Response": {
+      "main": [
+        [
+          {
+            "node": "Prepare Test Commits",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Summarize For PR Comment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Test Commits": {
+      "main": [
+        [
+          {
+            "node": "Create/Update Test File in PR Branch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Summarize For PR Comment": {
+      "main": [
+        [
+          {
+            "node": "Post PR Comment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "auto-test-generation-openrouter-demo",
+  "meta": {
+    "instanceId": "demo-instance"
+  },
+  "tags": [
+    {
+      "name": "demo"
+    },
+    {
+      "name": "github"
+    },
+    {
+      "name": "openrouter"
+    }
+  ]
+}
