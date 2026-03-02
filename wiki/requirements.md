@@ -16,9 +16,9 @@ This API is for testing purposes only and provides CRUD operations for managing 
 - Use Pydantic models for request/response validation
 - Store books in an in-memory list (no database required)
 - Each book should have:
-  - `id` (integer)
-  - `title` (string)
-  - `author` (string)
+  - `id` (integer, required)
+  - `title` (string, required)
+  - `author` (string, required)
   - `description` (optional string)
 
 ## Endpoints
