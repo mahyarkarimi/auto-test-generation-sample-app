@@ -1,0 +1,19 @@
+# simple ci
+name: CI
+
+on:[
+  push:[
+    branches: ["main"]
+  ]
+  pull_request:
+]
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3
+      - name: Run tests
+        run: |
+            echo "Hello from the future"
+            echo "This is a test"
