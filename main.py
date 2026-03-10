@@ -8,7 +8,7 @@ from typing import List, Optional
 class Book(BaseModel):
     id: int
     title: str
-    author: str
+    author: Optional[str] = None
     description: Optional[str] = None
 
 books: List[Book] = []
